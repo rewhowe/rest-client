@@ -1,0 +1,196 @@
+#!/usr/bin/env ruby
+
+require 'readline'
+require 'json'
+
+# configuration
+PROXIES = {
+  local: nil,
+  dev:     '--proxy example-proxy.co.jp:9001',
+  stg:     '--proxy example-proxy.co.jp:9002',
+  preprod: '--proxy example-proxy.co.jp:8001',
+  prod:    '--proxy example-proxy.co.jp:8002',
+} .freeze
+
+APIS = {
+  api1: 'http://api.example.jp.local/1.0/',
+  ext1: 'http://api.example.jp.local/external/1.0/',
+  ext2: 'http://api.example.jp.local/external/2.0/',
+}
+
+CONTENT_TYPE = "-H 'Content-Type: application/json'"
+X_DELETE     = "-X 'DELETE'"
+X_PUT        = "-X 'PUT'"
+
+REGEX_URL_BEGIN  = /^https?:\/\//
+REGEX_URL_PARAMS = /.+\?.*$/
+REGEX_SAVE_CMD   = /^save ([\w\.]+)$/
+
+################################################################################
+# Helper Methods
+
+def prompt(message, options = {})
+  Readline.readline(message, options[:history] || true)
+rescue Interrupt
+  puts ''
+  return if options[:exit] == false
+  exit
+end
+
+def get_proxy
+  env = prompt("connect to? [#{PROXIES.keys.join('/')}] ", history: false).to_s.to_sym
+  env = :local unless PROXIES.has_key?(env)
+  puts " connecting to #{env}"
+  PROXIES[env]
+end
+
+def get_url_base
+  api = prompt("use api? [#{APIS.keys.join('/')}] ", history: false).to_s.to_sym
+  api = APIS.keys.first unless APIS.has_key?(api)
+  puts " using #{api} api"
+  APIS[api]
+end
+
+def parse_cmd(cmd)
+  method, *url = cmd.split
+
+  [method, url.join.downcase]
+end
+
+def build_request(cmd)
+  method, url = parse_cmd(cmd)
+
+  return nil if method.nil?
+
+  options = nil
+  params = ''
+
+  case method.downcase
+  when 'get'
+    if (REGEX_URL_PARAMS =~ url).nil?
+      params = get_params
+      return nil if params.nil?
+    else
+      url.gsub!(/(=|&)/, '\\\\\1')
+    end
+    options = ''
+  when 'post'
+    options = get_request_body
+  when 'put'
+    puts 'warn: put is not tested'
+    options = get_request_body
+    options.prepend(X_PUT + ' ') unless options.nil?
+  when 'delete'
+    options = X_DELETE
+  else
+    puts 'not a valid method'
+  end
+
+  return if options.nil?
+
+  { method: method, url: url, options: options, params: params }
+end
+
+def get_params
+  params = [].tap do |p|
+    loop do
+      line = prompt(p.empty? ? '? ' : '& ', exit: false)
+      return nil if line.nil?
+
+      break if line.empty?
+      p << line.strip.gsub(/\s*=\s/, '\=')
+    end
+  end
+
+  "?#{params.join('\&')}"
+end
+
+def get_request_body
+  lines = [].tap do |l|
+    nesting_level = 0
+    loop do
+      line = prompt('* ' + ('  ' * nesting_level), exit: false)
+      return nil if line.nil?
+
+      break if line.empty?
+      nesting_level += line.count('{') - line.count('}')
+      l << line
+    end
+  end
+
+  unless valid_json?(lines.join)
+    puts 'json body is not valid'
+    return nil
+  end
+
+  "-d '#{lines.map(&:strip).join}'"
+end
+
+def valid_json?(lines)
+  (JSON.parse(lines) rescue nil).is_a?(Hash)
+end
+
+def pretty_print(response)
+  json_body = JSON.parse(response)
+  JSON.pretty_generate(json_body)
+rescue
+  response
+end
+
+def save_response(response, filename)
+  if response.nil?
+    puts 'no response to be saved'
+  else
+    begin
+      File.open(filename, 'w') { |file| file.write(pretty_print(response)) }
+      puts "saved response to #{filename}"
+    rescue
+      puts "sould not write to #{filename || 'file'}"
+    end
+  end
+end
+
+def readable_time(t)
+  case
+  when t < 1     then "#{(t * 1000).round(6)} ms"
+  when t >= 3600 then "#{(t / 3600.0).round(6)} hr"
+  when t >= 60   then "#{(t / 60.0).round(6)} min"
+  else                "#{t.round(6)} s"
+  end
+end
+
+# Main
+
+proxy = get_proxy
+url_base = get_url_base
+
+puts 'usage: <method> <path>[?<param>[&<param>]...]'
+puts 'save last response: save <filename>'
+
+response = nil
+loop do
+  cmd = prompt('> ')
+  next if cmd.empty?
+
+  if (filename = REGEX_SAVE_CMD.match(cmd))
+    save_response(response, filename[1])
+    next
+  end
+
+  request = build_request(cmd)
+  if request.nil?
+    puts 'aborted'
+    next
+  end
+
+  request[:url].prepend(url_base) if (REGEX_URL_BEGIN =~ request[:url]).nil?
+  full_url = "#{request[:url]}#{request[:params]}"
+  puts "requesting #{request[:method].to_s.upcase} #{full_url}"
+
+  t1 = Time.now
+  response = `curl #{proxy} #{CONTENT_TYPE} #{request[:options]} #{full_url} 2> /dev/null`
+  t2 = Time.now
+
+  puts "response time: #{readable_time(t2 - t1)}"
+  puts pretty_print(response)
+end
